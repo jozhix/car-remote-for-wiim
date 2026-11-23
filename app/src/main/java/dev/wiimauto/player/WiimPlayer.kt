@@ -3,6 +3,7 @@ package dev.wiimauto.player
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.C
@@ -35,6 +36,13 @@ class WiimPlayer(private val connection: WiimConnection) : SimpleBasePlayer(Loop
 
     @Volatile private var snapshot = Snapshot()
     @Volatile private var lastPreset: Int? = null
+
+    // The WiiM keeps reporting the old station for a moment after a preset change.
+    @Volatile private var pendingPreset: Int? = null
+    @Volatile private var pendingUntil = 0L
+    private var lastPublished: Pair<Int, MediaMetadata>? = null
+
+    var onNowPlaying: ((MediaMetadata) -> Unit)? = null
     private var lastPresetLoad = 0L
     private var released = false
 
@@ -46,6 +54,7 @@ class WiimPlayer(private val connection: WiimConnection) : SimpleBasePlayer(Loop
                 main.post {
                     if (!released) {
                         invalidateState()
+                        publishNowPlaying(force = false)
                         main.postDelayed(this, POLL_MS)
                     }
                 }
@@ -82,7 +91,9 @@ class WiimPlayer(private val connection: WiimConnection) : SimpleBasePlayer(Loop
             if (before.meta?.subtitle != meta?.subtitle) DebugLog.log("wiim", "station ${meta?.subtitle.orEmpty()}")
             snapshot = Snapshot(true, status, meta, presets)
             // Follow stations changed from the phone or WiiM app, so blank names keep their place.
-            if (status.status == "play") {
+            val pending = presets.firstOrNull { it.number == pendingPreset }
+            if (pending != null && pending.name.equals(meta?.subtitle, ignoreCase = true)) pendingPreset = null
+            if (pendingPreset == null && status.status == "play") {
                 presets.getOrNull(matchPreset(snapshot))?.let { lastPreset = it.number }
             }
         } catch (e: Exception) {
@@ -98,7 +109,7 @@ class WiimPlayer(private val connection: WiimConnection) : SimpleBasePlayer(Loop
         val current = snapshot
         val status = current.status
         val (items, index) = buildPlaylist(current)
-        val trackBased = status?.isTrackBased == true
+        val trackBased = isTrackSource(current)
         val playing = current.reachable && status?.isPlaying == true
         val position = if (trackBased) status?.positionMs ?: 0 else 0
 
@@ -138,8 +149,8 @@ class WiimPlayer(private val connection: WiimConnection) : SimpleBasePlayer(Loop
     private fun buildPlaylist(current: Snapshot): Pair<List<MediaItemData>, Int> {
         val status = current.status
         val live = liveMetadata(current)
-        val duration = status?.durationMs?.takeIf { it > 0 }
         val presetIndex = matchPreset(current)
+        val duration = if (presetIndex >= 0) null else status?.durationMs?.takeIf { it > 0 }
 
         if (presetIndex < 0) {
             val item = MediaItem.Builder().setMediaId(LIVE_ID).setMediaMetadata(live).build()
@@ -148,26 +159,56 @@ class WiimPlayer(private val connection: WiimConnection) : SimpleBasePlayer(Loop
                 .setMediaMetadata(live)
                 .setDurationUs(duration?.let { it * 1000 } ?: C.TIME_UNSET)
                 .setIsSeekable(duration != null)
+                .setIsDynamic(duration == null)
+                .setLiveConfiguration(if (duration == null) LIVE_STREAM else null)
                 .build()
             return listOf(data) to 0
         }
 
-        val items = current.presets.mapIndexed { index, preset ->
-            // The queue item stays fixed so song changes don't rebuild the car's list and scroll
-            // it to the top. Only the separate now-playing metadata carries the live song.
+        // Queue items never change. LiveMetadataPlayer reports the live song separately.
+        val items = current.presets.map { preset ->
             val station = presetMetadata(preset)
             val id = presetId(preset.number)
             val item = MediaItem.Builder().setMediaId(id).setMediaMetadata(station).build()
             MediaItemData.Builder(id)
                 .setMediaItem(item)
-                .setMediaMetadata(if (index == presetIndex) live else station)
+                .setMediaMetadata(station)
+                .setIsSeekable(false)
+                // Radio has no length, so mark it live instead of showing a 0:00 track.
+                .setIsDynamic(true)
+                .setLiveConfiguration(LIVE_STREAM)
                 .build()
         }
         return items to presetIndex
     }
 
-    private fun matchPreset(current: Snapshot): Int =
-        matchPresetIndex(current.presets, current.status, current.meta, lastPreset)
+    private fun matchPreset(current: Snapshot): Int {
+        val pending = pendingPreset
+        if (pending != null) {
+            if (SystemClock.elapsedRealtime() < pendingUntil) {
+                val index = current.presets.indexOfFirst { it.number == pending }
+                if (index >= 0) return index
+            } else {
+                pendingPreset = null
+            }
+        }
+        return matchPresetIndex(current.presets, current.status, current.meta, lastPreset)
+    }
+
+    /** Some radio streams report a length, so a matched preset always counts as radio. */
+    private fun isTrackSource(current: Snapshot) =
+        current.status?.isTrackBased == true && matchPreset(current) < 0
+
+    fun nowPlaying(): MediaMetadata = liveMetadata(snapshot)
+
+    private fun publishNowPlaying(force: Boolean) {
+        val metadata = nowPlaying()
+        val key = currentMediaItemIndex to metadata
+        if (force || key != lastPublished) {
+            lastPublished = key
+            onNowPlaying?.invoke(metadata)
+        }
+    }
 
     private fun liveMetadata(current: Snapshot): MediaMetadata {
         if (!current.reachable) {
@@ -206,7 +247,7 @@ class WiimPlayer(private val connection: WiimConnection) : SimpleBasePlayer(Loop
 
     override fun handleSeek(mediaItemIndex: Int, positionMs: Long, seekCommand: Int): ListenableFuture<*> {
         val current = snapshot
-        val trackBased = current.status?.isTrackBased == true
+        val trackBased = isTrackSource(current)
         DebugLog.log("control", "seek command $seekCommand, index $mediaItemIndex, tracks $trackBased")
         return when (seekCommand) {
             Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM -> command { connection.api.seekTo(positionMs / 1000) }
@@ -250,8 +291,16 @@ class WiimPlayer(private val connection: WiimConnection) : SimpleBasePlayer(Loop
 
     private fun playPreset(number: Int): ListenableFuture<*> {
         lastPreset = number
+        pendingPreset = number
+        pendingUntil = SystemClock.elapsedRealtime() + PENDING_PRESET_MS
         DebugLog.log("control", "preset $number")
-        return command(PRESET_SETTLE_MS) { connection.api.playPreset(number) }
+        return command(settleMs = 0) {
+            // With quick repeated presses, only the newest preset is sent to the WiiM.
+            if (pendingPreset == number) {
+                connection.api.playPreset(number)
+                Thread.sleep(PRESET_SETTLE_MS)
+            }
+        }
     }
 
     override fun handlePrepare(): ListenableFuture<*> = Futures.immediateVoidFuture()
@@ -278,7 +327,11 @@ class WiimPlayer(private val connection: WiimConnection) : SimpleBasePlayer(Loop
                 DebugLog.log("control", "command failed: ${e.javaClass.simpleName}: ${e.message}")
                 snapshot = snapshot.copy(reachable = false)
             }
-            main.post { done.set(Unit) }
+            main.post {
+                done.set(Unit)
+                // Runs after Media3 applies the new state, so the live song replaces the station.
+                main.post { if (!released) publishNowPlaying(force = true) }
+            }
         }
         return done
     }
@@ -291,7 +344,9 @@ class WiimPlayer(private val connection: WiimConnection) : SimpleBasePlayer(Loop
         private const val PRESET_REFRESH_MS = 60_000L
         private const val COMMAND_SETTLE_MS = 150L
         private const val PRESET_SETTLE_MS = 800L
+        private const val PENDING_PRESET_MS = 8000L
         private const val ALWAYS_PREVIOUS_MS = 24L * 60 * 60 * 1000
+        private val LIVE_STREAM = MediaItem.LiveConfiguration.Builder().build()
 
         fun presetId(number: Int) = "$PRESET_PREFIX$number"
 

@@ -2,6 +2,8 @@
 
 **Control your WiiM's presets from the Android Auto screen, even when the WiiM is on your phone's hotspot.**
 
+![Car Remote for WiiM running on an Android Auto car screen](docs/images/android-auto.jpg)
+
 A WiiM streamer connected to a car DSP over optical is a great way to get clean digital audio in a car.
 Controlling it while driving is the hard part. This small Android app puts your WiiM presets where they
 belong: on the car screen.
@@ -26,12 +28,13 @@ Phone hotspot ──── internet ───► WiiM ── optical ──► c
           commands only, no audio through the phone
 ```
 
-The phone only sends commands, so the music never passes through it.
+The phone only sends commands, so the music never passes through it. While Android Auto is connected, the app
+plays digital silence on the phone, because Android only sends steering wheel buttons to an app that is playing audio.
 
 ## Features
 
 - Browse and play your WiiM presets from Android Auto
-- Play, pause, next and previous from the car screen
+- Play, pause, next and previous from the car screen and steering wheel
 - Station name, current song and artwork
 - Finds the WiiM automatically, even when its hotspot IP address changes
 - Phone remote with preset buttons
@@ -39,16 +42,19 @@ The phone only sends commands, so the music never passes through it.
 - Quiet left/right test sound at 96 kHz / 24-bit
 - Local debug log for troubleshooting in the car, kept for 3 days
 
+<img src="docs/images/phone-remote.jpg" alt="Phone remote with now playing, playback controls and seven preset buttons" width="360">
+
 ## Current limitations
 
-- **Steering wheel buttons do not work yet.** Use the Android Auto screen.
+- **Steering wheel volume controls the car, not the WiiM.** Next, previous and play/pause go to the WiiM.
 - **Presets only.** You can play the presets saved on the WiiM, but not browse services, playlists or albums.
 - **Initial setup needs the WiiM Home app on your home network.** Presets, output settings and Wi-Fi are
   configured there first.
 - **Some stations may stall over mobile data.** In testing, a few radio presets stayed in loading while others
   started normally. The cause is still unknown.
 - **Android only.** CarPlay and iPhone are not supported.
-- **No prebuilt APK yet.** For now, build the app from source.
+- **The latest queue and progress bar fixes are new.** They were tested with a WiiM Pro at home, but are not yet
+  confirmed on a car screen.
 - **Lightly tested.** It has only been used on the setup below.
 
 ## Tested setup
@@ -78,7 +84,8 @@ either network without being reconfigured. A 2.4 GHz hotspot is the safest choic
 
 ### 2. Install the app
 
-Build the APK as described below and install it on your phone.
+Download the APK from the [latest release](https://github.com/jozhix/car-remote-for-wiim/releases/latest) and open
+it on your phone. Android will ask you to allow installing apps from your browser or file manager.
 
 ### 3. Allow it in Android Auto
 
@@ -99,8 +106,20 @@ Android Auto hides apps that were not installed from Google Play until you allow
 
 ### Start the hotspot automatically
 
-Android does not allow normal apps to turn on the internet hotspot. On Samsung phones, create a routine in
-**Modes and Routines**: when your car's Bluetooth connects, turn **Mobile Hotspot** on.
+Android does not allow normal apps to turn on the internet hotspot, but Samsung phones can do it with a routine.
+Wireless Android Auto starts with a Bluetooth connection, so that connection makes a good trigger:
+
+1. Connect to your car once, so its Bluetooth device is known to the phone.
+2. Open **Settings > Modes and Routines > Routines** and tap **+**.
+3. Under **If**, add **Bluetooth device** and choose your car or wireless Android Auto adapter, whichever
+   connects every time you start the car.
+4. Under **Then**, add **Connections > Mobile Hotspot** and set it to **On**.
+5. Save the routine with a name such as **Car hotspot**.
+6. Keep the option that reverses the routine's actions when it ends, so the hotspot turns off when you leave the car.
+7. Start the car and check that the hotspot turns on and the WiiM joins it.
+
+Menu names can vary between One UI versions. If the routine stops working after a software update, open it and
+save it again, or recreate it. On other Android phones, look for a similar built-in automation feature.
 
 ## Privacy
 
@@ -125,8 +144,8 @@ To include a read-only test against a real device, add `-Pwiim.host=<wiim-ip>`.
 
 ## Contributing
 
-Issues and pull requests are welcome. The most useful contributions right now are steering wheel support and
-test reports from other phones, cars and WiiM models. Please remove private details from any debug log you attach.
+Issues and pull requests are welcome. The most useful contributions right now are test reports from other
+phones, cars and WiiM models. Please remove private details from any debug log you attach.
 
 ## Background and credits
 

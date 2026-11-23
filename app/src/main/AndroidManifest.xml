@@ -7,6 +7,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Lets the app detect when Android Auto is connected. -->
+    <queries>
+        <package android:name="com.google.android.projection.gearhead" />
+    </queries>
+
     <application
         android:name=".WiimApp"
         android:allowBackup="false"

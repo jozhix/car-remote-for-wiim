@@ -9,3 +9,6 @@ local.properties
 *.jks
 *.keystore
 .claude/settings.local.json
+
+# Original photos contain metadata. Publish cleaned copies from docs/images.
+Photos/

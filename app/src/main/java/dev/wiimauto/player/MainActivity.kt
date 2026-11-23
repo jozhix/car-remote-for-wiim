@@ -406,7 +406,7 @@ class MainActivity : Activity() {
 
     /** Matches the steering wheel: tracks when the source has them, otherwise presets. */
     private fun step(direction: Int) {
-        if (status?.isTrackBased == true) {
+        if (status?.isTrackBased == true && activePresetIndex() < 0) {
             command { if (direction > 0) connection.api.next() else connection.api.previous() }
             return
         }

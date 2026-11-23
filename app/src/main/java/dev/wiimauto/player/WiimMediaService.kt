@@ -1,8 +1,12 @@
 package dev.wiimauto.player
 
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.view.KeyEvent
 import androidx.annotation.OptIn
+import androidx.car.app.connection.CarConnection
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.Observer
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
@@ -24,6 +28,30 @@ class WiimMediaService : MediaLibraryService() {
     private lateinit var player: WiimPlayer
     private var session: MediaLibrarySession? = null
     private val browseIo = Executors.newSingleThreadExecutor()
+    private val silence = SilentAudio()
+    private lateinit var carType: LiveData<Int>
+    private var carConnected = false
+    private var keyTestMode = false
+
+    private val carObserver = Observer<Int> { type ->
+        carConnected = type == CarConnection.CONNECTION_TYPE_PROJECTION
+        DebugLog.log("car", "Android Auto ${if (carConnected) "connected" else "not connected"} (type $type)")
+        updateSilence()
+    }
+
+    /** Silence runs only during Android Auto, so media keys work normally outside the car. */
+    private fun updateSilence() {
+        if (carConnected || keyTestMode) silence.start() else silence.stop()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val debuggable = applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+        if (debuggable && intent?.action == ACTION_TEST_KEYS) {
+            keyTestMode = true
+            updateSilence()
+        }
+        return super.onStartCommand(intent, flags, startId)
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -34,13 +62,17 @@ class WiimMediaService : MediaLibraryService() {
                 DebugLog.log("car", "queue changed: ${timeline.windowCount} items")
             }
         })
-        session = MediaLibrarySession.Builder(this, player, LibraryCallback()).build()
+        session = MediaLibrarySession.Builder(this, LiveMetadataPlayer(player), LibraryCallback()).build()
+        carType = CarConnection(this).type
+        carType.observeForever(carObserver)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? = session
 
     override fun onDestroy() {
         DebugLog.log("service", "destroyed")
+        carType.removeObserver(carObserver)
+        silence.stop()
         session?.release()
         session = null
         player.release()
@@ -142,5 +174,6 @@ class WiimMediaService : MediaLibraryService() {
 
     private companion object {
         const val ROOT_ID = "root"
+        const val ACTION_TEST_KEYS = "dev.wiimauto.player.TEST_KEYS"
     }
 }

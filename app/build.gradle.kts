@@ -1,6 +1,15 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// Release signing is optional and stays outside the repository.
+val signingDirectory = file(System.getProperty("user.home") + "/.car-remote-wiim")
+val signingFile = signingDirectory.resolve("signing.properties")
+val signingProperties = Properties().apply {
+    if (signingFile.exists()) signingFile.inputStream().use { load(it) }
 }
 
 android {
@@ -13,6 +22,24 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+    }
+
+    signingConfigs {
+        if (signingFile.exists()) {
+            create("release") {
+                storeFile = signingDirectory.resolve("release.jks")
+                storePassword = signingProperties.getProperty("password")
+                keyAlias = signingProperties.getProperty("alias")
+                keyPassword = signingProperties.getProperty("password")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            if (signingFile.exists()) signingConfig = signingConfigs.getByName("release")
+        }
     }
 
     compileOptions {
@@ -37,6 +64,8 @@ dependencies {
     implementation("androidx.media3:media3-session:1.6.1")
     implementation("androidx.media3:media3-common:1.6.1")
     implementation("androidx.media3:media3-datasource:1.6.1")
+    implementation("androidx.car.app:app:1.4.0")
+    implementation("androidx.lifecycle:lifecycle-livedata:2.8.7")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
