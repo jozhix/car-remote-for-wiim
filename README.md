@@ -29,15 +29,21 @@ Phone hotspot ──── internet ───► WiiM ── optical ──► c
 ```
 
 The phone only sends commands, so the music never passes through it. While Android Auto is connected, the app
-plays digital silence on the phone, because Android only sends steering wheel buttons to an app that is playing audio.
+plays inaudible noise (about -84 dBFS) on the phone, because Android only sends steering wheel buttons to an app that
+is playing audio, and pure digital silence did not make the car switch to Android Auto. This signal goes through
+Android Auto to the car's head unit. It is not sent to the WiiM and is not part of the WiiM's optical output.
 
 ## Features
 
 - Browse and play your WiiM presets from Android Auto
 - Play, pause, next and previous from the car screen and steering wheel
-- Station name, current song and artwork
-- Finds the WiiM automatically, even when its hotspot IP address changes
-- Phone remote with preset buttons
+- WiiM volume - and + buttons on the Android Auto player
+- Station name, current song, artwork and stream format
+- Sound tab in Android Auto for volume and EQ presets
+- Info tab in Android Auto with stream, Wi-Fi, network and device details
+- Finds the WiiM automatically, with a countdown while it joins the hotspot
+- Phone remote with presets, volume, EQ, audio output and Fixed Volume
+- Works alongside Spotify Connect from the official Spotify app
 - Connection test for checking the network from the driver's seat
 - Quiet left/right test sound at 96 kHz / 24-bit
 - Local debug log for troubleshooting in the car, kept for 3 days
@@ -47,14 +53,16 @@ plays digital silence on the phone, because Android only sends steering wheel bu
 ## Current limitations
 
 - **Steering wheel volume controls the car, not the WiiM.** Next, previous and play/pause go to the WiiM.
+  Use the - and + buttons on the Android Auto player for WiiM volume. They respond with a small delay.
+- **Fixed Volume uses an undocumented WiiM command.** Turning it on jumps the WiiM to 100%, so turn your DSP down first.
+  A future firmware update could change this command.
 - **Presets only.** You can play the presets saved on the WiiM, but not browse services, playlists or albums.
-- **Initial setup needs the WiiM Home app on your home network.** Presets, output settings and Wi-Fi are
-  configured there first.
+- **Initial setup needs the WiiM Home app on your home network.** Presets and Wi-Fi are configured there first.
 - **Some stations may stall over mobile data.** In testing, a few radio presets stayed in loading while others
   started normally. The cause is still unknown.
 - **Android only.** CarPlay and iPhone are not supported.
-- **The latest queue and progress bar fixes are new.** They were tested with a WiiM Pro at home, but are not yet
-  confirmed on a car screen.
+- **The Android Auto queue can still jump.** It can return to the top after about 2 seconds during playback.
+- **Starting the car can switch it from FM to Android Auto audio** when the WiiM is on, so the steering wheel works.
 - **Lightly tested.** It has only been used on the setup below.
 
 ## Tested setup

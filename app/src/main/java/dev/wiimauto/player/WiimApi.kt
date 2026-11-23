@@ -1,6 +1,10 @@
 package dev.wiimauto.player
 
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
+import java.net.URLEncoder
+import java.util.Locale
 
 /** Sends one httpapi.asp command and returns the raw response body. */
 fun interface WiimTransport {
@@ -18,9 +22,44 @@ data class DeviceInfo(val name: String, val uuid: String, val firmware: String, 
  * Picks the IP to reconnect to. A remembered device is matched by UUID only, so the app never
  * silently switches to a different WiiM. With nothing remembered, a lone WiiM is safe to adopt.
  */
-fun pickDevice(found: List<Pair<String, DeviceInfo>>, savedUuid: String?): String? =
-    if (savedUuid.isNullOrEmpty()) found.singleOrNull()?.first
-    else found.firstOrNull { it.second.uuid == savedUuid }?.first
+fun pickDevice(
+    found: List<Pair<String, DeviceInfo>>,
+    savedUuid: String?,
+    known: Set<String> = emptySet(),
+): String? {
+    if (savedUuid.isNullOrEmpty()) return found.singleOrNull()?.first
+    // A home WiiM and a car WiiM are both yours, so a lone previously used device is safe.
+    return found.firstOrNull { it.second.uuid == savedUuid }?.first
+        ?: found.filter { it.second.uuid in known }.singleOrNull()?.first
+}
+
+/** The documented hardware outputs. Not every model has all of them. */
+enum class AudioOutput(val code: Int, val label: String) {
+    OPTICAL(1, "Optical"),
+    LINE(2, "Line out"),
+    COAX(3, "Coaxial");
+
+    companion object {
+        fun fromCode(code: Int?) = entries.firstOrNull { it.code == code }
+    }
+}
+
+data class EqState(val enabled: Boolean, val name: String)
+
+data class DeviceStats(
+    val name: String,
+    val model: String,
+    val firmware: String,
+    val network: String,
+    val ip: String,
+    val rssi: String,
+    val snr: String,
+    val noise: String,
+    val frequencyMhz: String,
+    val linkMbps: String,
+    val internet: Boolean,
+    val fixedVolume: Boolean,
+)
 
 /**
  * Finds the playing preset. The station name is blank while a stream loads and always blank for
@@ -71,7 +110,21 @@ data class TrackMeta(
     val artUrl: String,
     val sampleRate: String,
     val bitDepth: String,
-)
+    val bitRate: String = "",
+) {
+    /** For example "320 kbps | 24 bit / 44.1 kHz". A reported 32 bit is the WiiM's internal format, so it is hidden. */
+    val formatLine: String
+        get() {
+            val rate = bitRate.toIntOrNull()?.takeIf { it > 0 }?.let { "$it kbps" }
+            val depth = bitDepth.toIntOrNull()?.takeIf { it in 1..31 }?.let { "$it bit" }
+            val khz = sampleRate.toIntOrNull()?.takeIf { it > 0 }?.let {
+                val value = it / 1000.0
+                (if (value % 1.0 == 0.0) value.toInt().toString() else String.format(Locale.US, "%.1f", value)) + " kHz"
+            }
+            val audio = listOfNotNull(depth, khz).joinToString(" / ").ifEmpty { null }
+            return listOfNotNull(rate, audio).joinToString(" | ")
+        }
+}
 
 data class Preset(val number: Int, val name: String, val source: String, val artUrl: String)
 
@@ -95,12 +148,68 @@ class WiimApi(private val transport: WiimTransport) {
     fun seekTo(seconds: Long) = send("setPlayerCmd:seek:$seconds")
     fun playPreset(number: Int) = send("MCUKeyShortClick:$number")
     fun playUrl(url: String) = send("setPlayerCmd:play:$url")
+    fun setVolume(percent: Int) = send("setPlayerCmd:vol:${percent.coerceIn(0, 100)}")
+
+    fun stats(): DeviceStats = parseStats(transport.get("getStatusEx"))
+
+    /** Undocumented, tested on the Mini. Turning Fixed Volume on forces the WiiM to 100%. */
+    fun setFixedVolume(fixed: Boolean) = sendChecked("setVolumeControl:${if (fixed) 1 else 0}")
+
+    /** EQGetStat answers "Failed" on current firmware, so read the state from EQGetBand. */
+    fun eq(): EqState = parseEq(transport.get("EQGetBand"))
+    fun eqPresets(): List<String> = parseStringList(transport.get("EQGetList"))
+    fun eqOff() = sendChecked("EQOff")
+
+    /** Names such as "R&B" and "Bass Booster" must be escaped inside the command. */
+    fun eqLoad(name: String) =
+        sendChecked("EQLoad:" + URLEncoder.encode(name, "UTF-8").replace("+", "%20"))
+
+    fun output(): AudioOutput? = parseOutput(transport.get("getNewAudioOutputHardwareMode"))
+    fun setOutput(output: AudioOutput) = sendChecked("setAudioOutputHardwareMode:${output.code}")
 
     private fun send(command: String) {
         transport.get(command)
     }
 
+    private fun sendChecked(command: String) {
+        val body = transport.get(command)
+        if (body.contains("Failed", ignoreCase = true) || body.contains("unknown command", ignoreCase = true)) {
+            throw IOException("WiiM refused the command: ${body.trim().take(60)}")
+        }
+    }
+
     companion object {
+        fun parseStats(body: String): DeviceStats {
+            val json = JSONObject(body)
+            return DeviceStats(
+                name = json.optString("DeviceName"),
+                model = json.optString("project"),
+                firmware = json.optString("firmware").removePrefix("Linkplay."),
+                network = decodeHex(json.optString("essid")),
+                ip = json.optString("apcli0"),
+                rssi = json.optString("RSSI"),
+                snr = json.optString("wlanSnr"),
+                noise = json.optString("wlanNoise"),
+                frequencyMhz = json.optString("wlanFreq"),
+                linkMbps = json.optString("wlanDataRate"),
+                internet = json.optString("internet") == "1",
+                fixedVolume = json.optString("volume_control") == "1",
+            )
+        }
+
+        fun parseEq(body: String): EqState {
+            val json = JSONObject(body)
+            return EqState(json.optString("EQStat").equals("On", true), json.optString("Name"))
+        }
+
+        fun parseOutput(body: String): AudioOutput? =
+            AudioOutput.fromCode(JSONObject(body).optString("hardware").toIntOrNull())
+
+        fun parseStringList(body: String): List<String> {
+            val list = JSONArray(body)
+            return (0 until list.length()).map { list.getString(it) }
+        }
+
         fun parseDevice(body: String): DeviceInfo {
             val json = JSONObject(body)
             return DeviceInfo(
@@ -136,6 +245,7 @@ class WiimApi(private val transport: WiimTransport) {
                 artUrl = secureUrl(meta.optString("albumArtURI")),
                 sampleRate = clean(meta.optString("sampleRate")),
                 bitDepth = clean(meta.optString("bitDepth")),
+                bitRate = clean(meta.optString("bitRate")),
             )
         }
 

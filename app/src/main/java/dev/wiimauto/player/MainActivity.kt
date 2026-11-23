@@ -30,7 +30,9 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
+import org.json.JSONException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
@@ -61,7 +63,7 @@ class MainActivity : Activity() {
     private lateinit var testButton: Button
     private lateinit var findButton: Button
     private lateinit var testSoundButton: Button
-    private lateinit var output: TextView
+    private lateinit var toolOutput: TextView
 
     private var presetKeys: List<PresetKey> = emptyList()
 
@@ -70,7 +72,24 @@ class MainActivity : Activity() {
     @Volatile private var meta: TrackMeta? = null
     @Volatile private var presets: List<Preset> = emptyList()
     @Volatile private var deviceName: String? = null
-    @Volatile private var lastPreset: Int? = null
+    private var lastPreset: Int?
+        get() = connection.lastPreset
+        set(value) {
+            connection.lastPreset = value
+        }
+    @Volatile private var eq: EqState? = null
+    @Volatile private var output: AudioOutput? = null
+    @Volatile private var soundReadAt = 0L
+    @Volatile private var fixedVolume: Boolean? = null
+    @Volatile private var playerBusy = false
+    @Volatile private var showingInfo = false
+    private var infoKey: List<Any?>? = null
+    private lateinit var fixedVolumeButton: Button
+    private var draggingVolume = false
+    private lateinit var volumeLabel: TextView
+    private lateinit var volumeSlider: SeekBar
+    private lateinit var eqButton: Button
+    private lateinit var outputButton: Button
     private var started = false
 
     private val poll = object : Runnable {
@@ -146,7 +165,8 @@ class MainActivity : Activity() {
                 ellipsize = TextUtils.TruncateAt.END
             }
             addView(presetName, matchWrap(top = 10))
-            addView(buildConnection(), matchWrap(top = 22))
+            addView(buildSound(), matchWrap(top = 22))
+            addView(buildConnection(), matchWrap(top = 14))
         }
         return ScrollView(this).apply {
             setBackgroundColor(DASH)
@@ -228,6 +248,139 @@ class MainActivity : Activity() {
         addView(nextButton, LinearLayout.LayoutParams(dp(64), dp(64)))
     }
 
+    private fun buildSound() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = rounded(PANEL, 14)
+        setPadding(dp(14), dp(12), dp(14), dp(14))
+
+        volumeLabel = text(16f, PAPER, bold = true).apply { text = "WiiM volume" }
+        addView(volumeLabel, matchWrap())
+        volumeSlider = SeekBar(context).apply {
+            max = 100
+            contentDescription = "WiiM volume"
+            progressTintList = ColorStateList.valueOf(PHOSPHOR)
+            thumbTintList = ColorStateList.valueOf(PHOSPHOR)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
+                    if (fromUser) volumeLabel.text = "WiiM volume $value%"
+                }
+
+                override fun onStartTrackingTouch(bar: SeekBar) {
+                    draggingVolume = true
+                }
+
+                override fun onStopTrackingTouch(bar: SeekBar) {
+                    draggingVolume = false
+                    val value = bar.progress
+                    DebugLog.log("phone", "volume $value")
+                    command { connection.api.setVolume(value) }
+                }
+            })
+        }
+        addView(volumeSlider, matchWrap(top = 6))
+        fixedVolumeButton = toolButton("Fixed volume") { toggleFixedVolume() }
+        addView(fixedVolumeButton, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)).apply { topMargin = dp(8) })
+
+        val buttons = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            eqButton = toolButton("EQ") { chooseEq() }
+            outputButton = toolButton("Output") { chooseOutput() }
+            addView(eqButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(5) })
+            addView(outputButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(5) })
+        }
+        addView(buttons, matchWrap(top = 8))
+        addView(
+            toolButton("Show technical info") { showTechnicalInfo(quiet = false) },
+            LinearLayout.LayoutParams(MATCH_PARENT, dp(48)).apply { topMargin = dp(10) },
+        )
+    }
+
+    /** Stays live: once shown, it reloads whenever the station, format or settings change. */
+    private fun showTechnicalInfo(quiet: Boolean) {
+        if (!quiet) showOutput("Reading WiiM details...")
+        toolsIo.execute {
+            val info = runCatching {
+                wiimInfoRows(connection).joinToString("\n") { (label, value) -> "$label: $value" }
+            }.getOrElse { "Failed: ${it.message}" }
+            main.post {
+                // Another tool may have replaced the output while this was loading.
+                if (!isDestroyed && (!quiet || showingInfo)) showOutput(info, technicalInfo = true)
+            }
+        }
+    }
+
+    /** Turning Fixed Volume on jumps the WiiM to 100%, so that direction asks first. */
+    private fun toggleFixedVolume() {
+        val fixed = fixedVolume ?: return
+        val apply = {
+            command {
+                connection.api.setFixedVolume(!fixed)
+                DebugLog.log("control", "Fixed Volume ${if (fixed) "off" else "on"}")
+                soundReadAt = 0
+            }
+        }
+        if (fixed) {
+            apply()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Turn on Fixed Volume?")
+            .setMessage("The WiiM will jump to 100%. Turn down your DSP or car volume first.")
+            .setPositiveButton("Turn on") { _, _ -> apply() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun chooseEq() {
+        toolsIo.execute {
+            val names = runCatching { connection.api.eqPresets() }.getOrDefault(emptyList())
+            main.post {
+                if (isDestroyed) return@post
+                if (names.isEmpty()) {
+                    showOutput("Could not read the EQ list from the WiiM.")
+                    return@post
+                }
+                val labels = (listOf("EQ off") + names).toTypedArray()
+                AlertDialog.Builder(this)
+                    .setTitle("WiiM equalizer")
+                    .setItems(labels) { _, index ->
+                        DebugLog.log("phone", "EQ ${labels[index]}")
+                        command {
+                            if (index == 0) connection.api.eqOff() else connection.api.eqLoad(names[index - 1])
+                            soundReadAt = 0
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }
+    }
+
+    /** A wrong output silences the car, so this always asks first. */
+    private fun chooseOutput() {
+        val outputs = AudioOutput.entries
+        AlertDialog.Builder(this)
+            .setTitle("WiiM audio output")
+            .setItems(outputs.map { it.label }.toTypedArray()) { _, index ->
+                val choice = outputs[index]
+                if (choice == output) return@setItems
+                AlertDialog.Builder(this)
+                    .setTitle("Switch to ${choice.label}?")
+                    .setMessage("Sound stops on ${output?.label ?: "the current output"}. Your DSP must be connected to ${choice.label}.")
+                    .setPositiveButton("Switch") { _, _ ->
+                        DebugLog.log("phone", "output ${choice.label}")
+                        command {
+                            connection.api.setOutput(choice)
+                            soundReadAt = 0
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun buildConnection() = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         background = rounded(PANEL, 14)
@@ -266,14 +419,14 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(MATCH_PARENT, dp(48)).apply { topMargin = dp(10) },
         )
 
-        output = TextView(context).apply {
+        toolOutput = TextView(context).apply {
             typeface = Typeface.MONOSPACE
             textSize = 12f
             setTextColor(PAPER)
             setTextIsSelectable(true)
             visibility = View.GONE
         }
-        addView(output, matchWrap(top = 12))
+        addView(toolOutput, matchWrap(top = 12))
     }
 
     private fun rebuildPresetKeys() {
@@ -328,13 +481,18 @@ class MainActivity : Activity() {
                 setColor(if (reachable) PHOSPHOR else FAULT)
             } }
         statusText.text = when {
+            reachable && playerBusy -> "Connected, but the WiiM player is not answering"
             reachable -> "Connected to ${name ?: "WiiM"}"
             connection.host.isEmpty() -> "No WiiM selected"
             currentStatus == null -> "Looking for WiiM at ${connection.host}"
             else -> "Lost connection to ${connection.host}"
         }
 
-        if (reachable) {
+        if (reachable && playerBusy) {
+            titleText.text = "WiiM player not responding"
+            artistText.text = "Restart the WiiM if this stays."
+            stationText.text = ""
+        } else if (reachable) {
             titleText.text = currentMeta?.title?.ifEmpty { null }
                 ?: currentStatus?.fallbackTitle?.ifEmpty { null } ?: "Nothing playing"
             artistText.text = currentMeta?.artist?.ifEmpty { null } ?: currentStatus?.fallbackArtist.orEmpty()
@@ -367,6 +525,24 @@ class MainActivity : Activity() {
         }
         presetName.text = presets.getOrNull(active)?.name.orEmpty()
         presetName.visibility = if (presetName.text.isEmpty()) View.GONE else View.VISIBLE
+
+        if (!draggingVolume) {
+            val volume = currentStatus?.volume
+            volumeLabel.text = when {
+                !reachable || volume == null -> "WiiM volume"
+                fixedVolume == true -> "WiiM volume $volume% (fixed)"
+                else -> "WiiM volume $volume%"
+            }
+            if (volume != null) volumeSlider.progress = volume
+        }
+        volumeSlider.isEnabled = reachable && fixedVolume != true
+        volumeSlider.alpha = if (volumeSlider.isEnabled) 1f else 0.4f
+        fixedVolumeButton.isEnabled = reachable && fixedVolume != null
+        fixedVolumeButton.text = "Fixed volume: " + when (fixedVolume) { true -> "On"; false -> "Off"; null -> "?" }
+        eqButton.isEnabled = reachable
+        outputButton.isEnabled = reachable
+        eqButton.text = "EQ: " + (eq?.let { if (it.enabled) it.name else "Off" } ?: "?")
+        outputButton.text = "Output: " + (output?.label ?: "?")
     }
 
     // Player
@@ -385,8 +561,35 @@ class MainActivity : Activity() {
             status = nextStatus
             meta = nextMeta
             reachable = true
+            playerBusy = false
+            val now = System.currentTimeMillis()
+            if (now - soundReadAt > SOUND_REFRESH_MS) {
+                soundReadAt = now
+                eq = runCatching { connection.api.eq() }.getOrDefault(eq)
+                output = runCatching { connection.api.output() }.getOrDefault(output)
+                fixedVolume = runCatching { connection.api.stats().fixedVolume }.getOrDefault(fixedVolume)
+            }
+            val key = listOf(
+                nextStatus.status, nextStatus.vendor, nextStatus.volume, nextStatus.muted,
+                nextMeta?.subtitle, nextMeta?.sampleRate, nextMeta?.bitDepth, nextMeta?.bitRate,
+                eq, output, fixedVolume,
+            )
+            if (key != infoKey) {
+                infoKey = key
+                if (showingInfo) main.post { showTechnicalInfo(quiet = true) }
+            }
+        } catch (_: JSONException) {
+            // Device info still answering means the network is fine and only the player stalled.
+            val answers = runCatching { connection.api.stats() }.isSuccess
+            if (host == connection.host) {
+                reachable = answers
+                playerBusy = answers
+            }
         } catch (_: Exception) {
-            if (host == connection.host) reachable = false
+            if (host == connection.host) {
+                reachable = false
+                playerBusy = false
+            }
         }
     }
 
@@ -395,6 +598,7 @@ class MainActivity : Activity() {
     private fun playPause() {
         val current = status
         val preset = lastPreset ?: presets.firstOrNull()?.number
+        DebugLog.log("phone", if (current?.isPlaying == true) "pause" else "play")
         command {
             when {
                 current?.isPlaying == true -> connection.api.pause()
@@ -407,6 +611,7 @@ class MainActivity : Activity() {
     /** Matches the steering wheel: tracks when the source has them, otherwise presets. */
     private fun step(direction: Int) {
         if (status?.isTrackBased == true && activePresetIndex() < 0) {
+            DebugLog.log("phone", if (direction > 0) "next track" else "previous track")
             command { if (direction > 0) connection.api.next() else connection.api.previous() }
             return
         }
@@ -422,6 +627,7 @@ class MainActivity : Activity() {
 
     private fun playPreset(number: Int) {
         lastPreset = number
+        DebugLog.log("phone", "preset $number")
         command(PRESET_SETTLE_MS) { connection.api.playPreset(number) }
     }
 
@@ -616,9 +822,10 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showOutput(value: String) {
-        output.text = value
-        output.visibility = View.VISIBLE
+    private fun showOutput(value: String, technicalInfo: Boolean = false) {
+        showingInfo = technicalInfo
+        toolOutput.text = value
+        toolOutput.visibility = View.VISIBLE
     }
 
     // Artwork
@@ -730,6 +937,7 @@ class MainActivity : Activity() {
         const val POLL_MS = 2000L
         const val COMMAND_SETTLE_MS = 150L
         const val PRESET_SETTLE_MS = 800L
+        const val SOUND_REFRESH_MS = 10_000L
         const val ART_TIMEOUT_MS = 5000
         const val ART_MAX_PX = 512
         const val TEST_START_TIMEOUT_MS = 6000L

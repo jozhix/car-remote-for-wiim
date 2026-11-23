@@ -40,16 +40,25 @@ class WiimConnection(context: Context) : WiimTransport {
         get() = prefs.getString(KEY_HOST, DEFAULT_HOST) ?: DEFAULT_HOST
         set(value) {
             if (value != host) {
-                prefs.edit().putString(KEY_HOST, value).remove(KEY_PIN).remove(KEY_UUID).apply()
+                prefs.edit().putString(KEY_HOST, value).remove(KEY_PIN).remove(KEY_UUID).remove(KEY_LAST_PRESET).apply()
             }
             route = null
         }
 
+    /** Shared by the phone and car screens, because WiiM Radio stations report no name. */
+    var lastPreset: Int?
+        get() = prefs.getInt(KEY_LAST_PRESET, 0).takeIf { it > 0 }
+        set(value) {
+            if (value != lastPreset) prefs.edit().putInt(KEY_LAST_PRESET, value ?: 0).apply()
+        }
+
     override fun get(command: String): String {
+        val startedHost = host
         val body = try {
             fetch(command)
         } catch (failure: IOException) {
-            if (!rediscover()) throw failure
+            // A search may have moved the WiiM during this request, so try the new IP first.
+            if (host == startedHost && !rediscover()) throw failure
             fetch(command)
         }
         discoveryDelay = DISCOVERY_INTERVAL_MS
@@ -59,20 +68,30 @@ class WiimConnection(context: Context) : WiimTransport {
     /** The WiiM gets a new IP on the car hotspot, so look for the same device by UUID. */
     private fun rediscover(): Boolean {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastDiscovery < discoveryDelay || !discoveryLock.tryLock()) return false
+        val fast = now < fastSearchUntil
+        val wait = if (fast) FAST_DISCOVERY_INTERVAL_MS else discoveryDelay
+        if (now - lastDiscovery < wait || !discoveryLock.tryLock()) return false
         try {
             lastDiscovery = now
             // Search less often while the WiiM stays away, to save battery.
-            discoveryDelay = minOf(discoveryDelay * 2, MAX_DISCOVERY_INTERVAL_MS)
+            if (!fast) discoveryDelay = minOf(discoveryDelay * 2, MAX_DISCOVERY_INTERVAL_MS)
             val savedUuid = prefs.getString(KEY_UUID, null)
+            val known = prefs.getStringSet(KEY_KNOWN, emptySet()).orEmpty()
             DebugLog.log("search", "saved IP $host failed; searching ${DebugLog.interfaces()}")
             val found = scan()
             DebugLog.log("search", "found: ${found.joinToString { "${it.second.name} ${it.first}" }.ifEmpty { "none" }}")
-            val ip = pickDevice(found, savedUuid) ?: return false
+            val ip = pickDevice(found, savedUuid, known) ?: return false
             if (ip == host) return false
+            val uuid = found.first { it.first == ip }.second.uuid
             DebugLog.log("search", "moved from $host to $ip")
             prefs.edit().putString(KEY_HOST, ip).apply {
-                if (savedUuid == null) remove(KEY_PIN)
+                if (uuid != savedUuid) {
+                    putString(KEY_UUID, uuid)
+                    remove(KEY_LAST_PRESET)
+                    // Each known WiiM keeps its own certificate pin.
+                    val pin = prefs.getString(pinKey(uuid), null)
+                    if (pin != null) putString(KEY_PIN, pin) else remove(KEY_PIN)
+                }
             }.apply()
             route = null
             return true
@@ -85,12 +104,29 @@ class WiimConnection(context: Context) : WiimTransport {
     }
 
     private fun learnDevice(network: Network?) {
-        if (prefs.contains(KEY_UUID)) return
         runCatching {
-            val uuid = WiimApi.parseDevice(request(host, network, "getStatusEx", TIMEOUT_MS, pinned = true)).uuid
-            if (uuid.isNotEmpty()) prefs.edit().putString(KEY_UUID, uuid).apply()
+            val uuid = prefs.getString(KEY_UUID, null)
+                ?: WiimApi.parseDevice(request(host, network, "getStatusEx", TIMEOUT_MS, pinned = true)).uuid
+            if (uuid.isEmpty()) return
+            val known = prefs.getStringSet(KEY_KNOWN, emptySet()).orEmpty()
+            if (uuid in known && prefs.contains(pinKey(uuid))) return
+            prefs.edit()
+                .putString(KEY_UUID, uuid)
+                .putStringSet(KEY_KNOWN, known + uuid)
+                .putString(pinKey(uuid), prefs.getString(KEY_PIN, null))
+                .apply()
         }
     }
+
+    /** Searches every few seconds for a while, because the WiiM joins the hotspot after Android Auto starts. */
+    fun searchFast(durationMs: Long) {
+        fastSearchUntil = SystemClock.elapsedRealtime() + durationMs
+        lastDiscovery = -MAX_DISCOVERY_INTERVAL_MS
+    }
+
+    val routeLabel: String get() = route?.label ?: "none"
+
+    fun phoneInterfaces(): String = localSubnets().joinToString { "${it.interfaceName} ${it.address}" }
 
     private fun fetch(command: String): String {
         if (host.isEmpty()) throw IOException("No WiiM selected")
@@ -208,7 +244,8 @@ class WiimConnection(context: Context) : WiimTransport {
         connection.sslSocketFactory = sslContext(pinned).socketFactory
         connection.setHostnameVerifier { hostname, _ -> hostname == ip }
         connection.connectTimeout = timeoutMs
-        connection.readTimeout = timeoutMs
+        // A playing Mini can take over 3 s to answer player commands on a healthy network.
+        connection.readTimeout = if (pinned) READ_TIMEOUT_MS else timeoutMs
         try {
             if (connection.responseCode != 200) throw IOException("HTTP ${connection.responseCode}")
             return connection.inputStream.bufferedReader().use { it.readText() }
@@ -259,7 +296,13 @@ class WiimConnection(context: Context) : WiimTransport {
         private const val KEY_HOST = "host"
         private const val KEY_PIN = "cert_pin"
         private const val KEY_UUID = "device_uuid"
+        private const val KEY_KNOWN = "known_uuids"
+        private const val KEY_LAST_PRESET = "last_preset"
         private const val DISCOVERY_INTERVAL_MS = 15_000L
+        private const val FAST_DISCOVERY_INTERVAL_MS = 3_000L
+        @Volatile private var fastSearchUntil = 0L
+
+        private fun pinKey(uuid: String) = "cert_pin_$uuid"
 
         // Shared because the phone screen and the Android Auto service each have a connection.
         private val discoveryLock = ReentrantLock()
@@ -267,6 +310,7 @@ class WiimConnection(context: Context) : WiimTransport {
         @Volatile private var lastDiscovery = -MAX_DISCOVERY_INTERVAL_MS
         @Volatile private var discoveryDelay = DISCOVERY_INTERVAL_MS
         private const val TIMEOUT_MS = 2500
+        private const val READ_TIMEOUT_MS = 9000
         private const val HTTPS_PORT = 443
         private const val SCAN_CONNECT_TIMEOUT_MS = 600
         private const val SCAN_THREADS = 32
