@@ -1,0 +1,9 @@
+* text=auto
+*.bat text eol=crlf
+gradlew text eol=lf
+*.jar binary
+*.png binary
+
+# Private project notes and the old prototype stay out of the public export.
+CLAUDE.md export-ignore
+WiimHttpApi.html export-ignore
